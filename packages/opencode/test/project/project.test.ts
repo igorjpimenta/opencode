@@ -234,6 +234,87 @@ describe("Project.fromDirectory", () => {
       ).toBe(remoteID)
     }),
   )
+
+  it.live("migrates project rename when workspace table has no project_id column", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const tmp = yield* tmpdirScoped({ git: true })
+      const projects = yield* Project.Service
+      const rootResult = yield* projects.fromDirectory(tmp)
+      const rootProject = rootResult.project
+      const remoteID = remoteProjectID("github.com/acme/app")
+      const sessionID = crypto.randomUUID() as SessionID
+
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: rootProject.id,
+          slug: sessionID,
+          directory: tmp,
+          title: "test",
+          version: "0.0.0-test",
+          time_created: Date.now(),
+          time_updated: Date.now(),
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      // Simulate a database migrated by a newer build (20260808023530_workspace_domain),
+      // where workspaces are provider bindings and carry no project_id column.
+      yield* db.run(`PRAGMA foreign_keys=OFF;`)
+      yield* db.run(`DROP TABLE \`workspace\`;`)
+      yield* db.run(`
+        CREATE TABLE \`workspace\` (
+          \`id\` text PRIMARY KEY,
+          \`provider\` text NOT NULL,
+          \`binding\` text NOT NULL,
+          \`created_at\` integer NOT NULL,
+          \`last_used_at\` integer NOT NULL
+        );
+      `)
+      yield* db.run(
+        `INSERT INTO \`workspace\`(\`id\`, \`provider\`, \`binding\`, \`created_at\`, \`last_used_at\`) VALUES ('ws_test', 'test', 'test', 0, 0);`,
+      )
+      yield* db.run(`PRAGMA foreign_keys=ON;`)
+
+      yield* Effect.promise(() => $`git remote add origin git@github.com:acme/app.git`.cwd(tmp).quiet())
+
+      try {
+        const result = yield* projects.fromDirectory(tmp)
+
+        expect(result.project.id).toBe(remoteID)
+        expect(
+          (yield* db.select().from(SessionTable).where(eq(SessionTable.id, sessionID)).get().pipe(Effect.orDie))
+            ?.project_id,
+        ).toBe(remoteID)
+        expect(
+          yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, rootProject.id)).get().pipe(Effect.orDie),
+        ).toBeUndefined()
+        expect(
+          (yield* db.all<{ id: string }>(`SELECT \`id\` FROM \`workspace\`;`)).map((row) => row.id),
+        ).toContain("ws_test")
+      } finally {
+        // Restore the workspace schema the other tests in this file rely on.
+        yield* db.run(`PRAGMA foreign_keys=OFF;`)
+        yield* db.run(`DROP TABLE \`workspace\`;`)
+        yield* db.run(`
+          CREATE TABLE \`workspace\` (
+            \`id\` text PRIMARY KEY,
+            \`type\` text NOT NULL,
+            \`name\` text DEFAULT '' NOT NULL,
+            \`branch\` text,
+            \`directory\` text,
+            \`extra\` text,
+            \`project_id\` text NOT NULL,
+            \`time_used\` integer NOT NULL DEFAULT 0,
+            CONSTRAINT \`fk_workspace_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
+          );
+        `)
+        yield* db.run(`PRAGMA foreign_keys=ON;`)
+      }
+    }),
+  )
 })
 
 describe("Project.fromDirectory git failure paths", () => {

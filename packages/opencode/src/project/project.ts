@@ -179,11 +179,17 @@ const layer = Layer.effect(
                 .set({ project_id: newID, time_updated: sql`${SessionTable.time_updated}` })
                 .where(eq(SessionTable.project_id, oldID))
                 .run()
-              yield* d
-                .update(WorkspaceTable)
-                .set({ project_id: newID })
-                .where(eq(WorkspaceTable.project_id, oldID))
-                .run()
+              // The workspace table only carries project_id on databases migrated
+              // before workspaces became provider bindings. Skip the update when
+              // the column is absent instead of failing the whole project load.
+              const workspaceColumns = yield* d.all<{ name: string }>(`PRAGMA table_info("workspace")`)
+              if (workspaceColumns.some((column) => column.name === "project_id")) {
+                yield* d
+                  .update(WorkspaceTable)
+                  .set({ project_id: newID })
+                  .where(eq(WorkspaceTable.project_id, oldID))
+                  .run()
+              }
 
               if (oldProject) yield* d.delete(ProjectTable).where(eq(ProjectTable.id, oldID)).run()
             }),
